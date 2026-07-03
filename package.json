@@ -1,13 +1,14 @@
 {
   "name": "dedsec-server",
   "version": "2.0.0",
-  "description": "DEDSEC Command Server - Optimized for 4000+ players",
+  "description": "DEDSEC Server with WebSocket for instant commands",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "ws": "^8.14.2"
   },
   "engines": {
     "node": ">=16.0.0"
