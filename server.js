@@ -1,132 +1,93 @@
-const http = require('http');
-const WebSocket = require('ws');
+const express = require('express');
+const cors = require('cors');
 
+const app = express();
 const PORT = process.env.PORT || 3000;
 
-// خريطة userId -> { ws, username, placeId, jobId }
-const clients = new Map();
-// خريطة عكسية username -> userId
-const usernameToId = new Map();
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
-const server = http.createServer((req, res) => {
-    // نترك HTTP endpoint للـ fallback فقط
-    if (req.method === 'POST' && req.url === '/ping') {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', () => {
-            try {
-                const data = JSON.parse(body);
-                // تحديث البيانات (للـ fallback)
-                if (data.userId) {
-                    clients.set(data.userId, {
-                        ws: null, // لا يوجد ws في HTTP
-                        username: data.username,
-                        placeId: data.placeId,
-                        jobId: data.jobId
-                    });
-                    usernameToId.set(data.username, data.userId);
-                }
-                res.writeHead(200);
-                res.end('ok');
-            } catch(e) {
-                res.writeHead(400);
-                res.end('bad request');
-            }
+// تخزين الأوامر مع الوقت
+let commands = [];
+let players = {}; // تخزين معلومات اللاعبين (آخر تحديث)
+
+// دالة لإضافة أمر جديد
+function addCommand(username, userId, message, time) {
+    commands.push({
+        username,
+        userId,
+        message,
+        time: time || Date.now()
+    });
+    // الاحتفاظ بآخر 1000 أمر فقط لتوفير الذاكرة
+    if (commands.length > 1000) {
+        commands = commands.slice(-1000);
+    }
+}
+
+// نقطة نهاية لإرسال الأوامر (من القادة)
+app.post('/update', (req, res) => {
+    const { username, userId, message, time } = req.body;
+    if (!username || !userId || !message) {
+        return res.status(400).json({ error: 'Missing fields' });
+    }
+    const cmdTime = time || Date.now();
+    addCommand(username, userId, message, cmdTime);
+    res.json({ status: 'ok' });
+});
+
+// نقطة نهاية لجلب الأوامر الجديدة فقط (مع last)
+app.get('/data', (req, res) => {
+    const last = parseInt(req.query.last) || 0;
+    const newCommands = commands.filter(cmd => cmd.time > last);
+    res.json({ commands: newCommands });
+});
+
+// نقطة نهاية لتحديث حالة اللاعب (ping)
+app.post('/ping', (req, res) => {
+    const { username, userId, placeId, jobId } = req.body;
+    if (username && userId) {
+        players[username] = {
+            userId,
+            placeId,
+            jobId,
+            lastSeen: Date.now()
+        };
+    }
+    res.json({ status: 'ok' });
+});
+
+// نقطة نهاية للحصول على قائمة اللاعبين المسجلين
+app.get('/players', (req, res) => {
+    // حذف اللاعبين غير النشطين منذ أكثر من 60 ثانية
+    const now = Date.now();
+    for (const name in players) {
+        if (now - players[name].lastSeen > 60000) {
+            delete players[name];
+        }
+    }
+    res.json(Object.keys(players));
+});
+
+// نقطة نهاية للحصول على معلومات لاعب معين (للـ jointotarget)
+app.get('/player/:name', (req, res) => {
+    const name = req.params.name;
+    const info = players[name];
+    if (info) {
+        res.json({
+            placeId: info.placeId,
+            jobId: info.jobId
         });
-    } else if (req.method === 'GET' && req.url === '/players') {
-        // قائمة اللاعبين (للـ fallback)
-        const list = Array.from(clients.values()).map(c => c.username);
-        res.writeHead(200, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify(list));
     } else {
-        res.writeHead(404);
-        res.end();
+        res.status(404).json({ error: 'Player not found' });
     }
 });
 
-const wss = new WebSocket.Server({ server });
-
-wss.on('connection', (ws) => {
-    let currentUserId = null;
-
-    ws.on('message', (message) => {
-        let data;
-        try {
-            data = JSON.parse(message);
-        } catch(e) {
-            return;
-        }
-
-        // تسجيل / تحديث
-        if (data.type === 'ping' && data.userId) {
-            currentUserId = data.userId;
-            clients.set(data.userId, {
-                ws: ws,
-                username: data.username,
-                placeId: data.placeId,
-                jobId: data.jobId
-            });
-            usernameToId.set(data.username, data.userId);
-        }
-        // أمر من قائد (لا نتحقق هنا، العميل سيفعل)
-        else if (data.type === 'command' && data.userId) {
-            const { username, userId, targetName, command, extra } = data;
-            
-            // تحديث بيانات المرسل إن لزم
-            if (!clients.has(userId)) {
-                clients.set(userId, { ws, username, placeId: null, jobId: null });
-                usernameToId.set(username, userId);
-            }
-
-            // إذا الأمر موجه لشخص محدد
-            if (targetName && targetName !== 'all') {
-                const targetId = usernameToId.get(targetName);
-                if (targetId && clients.has(targetId)) {
-                    const targetClient = clients.get(targetId);
-                    if (targetClient.ws && targetClient.ws.readyState === WebSocket.OPEN) {
-                        targetClient.ws.send(JSON.stringify({
-                            userId: userId,
-                            username: username,
-                            targetName: targetName,
-                            command: command,
-                            extra: extra || {}
-                        }));
-                    }
-                }
-            } else {
-                // بث للجميع ما عدا المرسل
-                const msg = JSON.stringify({
-                    userId: userId,
-                    username: username,
-                    targetName: 'all',
-                    command: command,
-                    extra: extra || {}
-                });
-                clients.forEach((client, id) => {
-                    if (id !== userId && client.ws && client.ws.readyState === WebSocket.OPEN) {
-                        client.ws.send(msg);
-                    }
-                });
-            }
-        }
-        // طلب قائمة اللاعبين عبر WS
-        else if (data.type === 'get_players') {
-            const list = Array.from(clients.values()).map(c => c.username);
-            ws.send(JSON.stringify({ type: 'playerlist', players: list }));
-        }
-    });
-
-    ws.on('close', () => {
-        if (currentUserId) {
-            const client = clients.get(currentUserId);
-            if (client) {
-                usernameToId.delete(client.username);
-                clients.delete(currentUserId);
-            }
-        }
-    });
+// نقطة نهاية للتحقق من صحة السيرفر (اختياري)
+app.get('/', (req, res) => {
+    res.send('DEDSEC Server Running');
 });
 
-server.listen(PORT, () => {
+app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
