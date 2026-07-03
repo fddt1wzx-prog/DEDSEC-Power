@@ -1,7 +1,7 @@
 {
   "name": "dedsec-server",
   "version": "1.0.0",
-  "description": "DEDSEC server for Roblox commands",
+  "description": "DEDSEC server with Long Polling",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
