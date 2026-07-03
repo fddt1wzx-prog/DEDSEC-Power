@@ -1,89 +1,56 @@
 const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
 const PORT = process.env.PORT || 3000;
+const SECRET_TOKEN = "DEDSEC_SECURE_2025_X7K9P2";
+
+// تخزين العملاء: username -> { ws, userId, placeId, jobId, lastPing }
+const clients = new Map();
+
+// تخزين الأوامر المعلقة (في حال كان العميل غير متصل)
+const pendingCommands = new Map(); // key: username أو 'all', value: command object
 
 app.use(express.json({ limit: '1mb' }));
 
-// ============================
-// الثوابت والإعدادات
-// ============================
-const SECRET_TOKEN = "DEDSEC_SECURE_2025_X7K9P2"; // يجب تطابق المفتاح مع السكربت
+// ---------- HTTP endpoints ----------
 
-const PLAYER_EXPIRE_SECONDS = 60;        // حذف اللاعب بعد 60 ثانية من آخر ping
-const COMMAND_EXPIRE_SECONDS = 30;       // حذف الأمر بعد 30 ثانية
-const MAX_COMMANDS_PER_PLAYER = 20;      // حد أقصى للأوامر المخزنة لكل لاعب
-
-// ============================
-// التخزين الداخلي
-// ============================
-const players = new Map();          // key: username (string) -> { userId, placeId, jobId, lastPing }
-const commands = new Map();         // key: targetUsername (string) -> array of { cmd, commander, time, extra? }
-
-// ============================
-// دوال مساعدة
-// ============================
-function cleanExpiredPlayers() {
-    const now = Date.now();
-    for (const [name, data] of players) {
-        if (now - data.lastPing > PLAYER_EXPIRE_SECONDS * 1000) {
-            players.delete(name);
-        }
-    }
-}
-
-function cleanExpiredCommands() {
-    const now = Date.now();
-    for (const [target, cmdList] of commands) {
-        const filtered = cmdList.filter(cmd => now - cmd.time <= COMMAND_EXPIRE_SECONDS * 1000);
-        if (filtered.length === 0) {
-            commands.delete(target);
-        } else {
-            commands.set(target, filtered);
-        }
-    }
-}
-
-// تنظيف كل 30 ثانية
-setInterval(() => {
-    cleanExpiredPlayers();
-    cleanExpiredCommands();
-}, 30000);
-
-// ============================
-// نقاط النهاية (Endpoints)
-// ============================
-
-// 1. Ping – تسجيل تواجد اللاعب
+// 1. Ping - تسجيل اللاعب (يُستخدم لتحديث البيانات)
 app.post('/ping', (req, res) => {
     const { username, userId, placeId, jobId, token } = req.body;
-    if (token !== SECRET_TOKEN) {
-        return res.status(401).json({ error: 'Invalid token' });
-    }
-    if (!username || !userId) {
-        return res.status(400).json({ error: 'Missing username or userId' });
-    }
+    if (token !== SECRET_TOKEN) return res.status(401).json({ error: 'Invalid token' });
+    if (!username || !userId) return res.status(400).json({ error: 'Missing username or userId' });
 
-    players.set(username, {
-        userId,
-        placeId: placeId || '',
-        jobId: jobId || '',
-        lastPing: Date.now()
-    });
-
+    // تحديث بيانات العميل إذا كان متصلاً عبر WebSocket
+    const client = clients.get(username);
+    if (client) {
+        client.userId = userId;
+        client.placeId = placeId || '';
+        client.jobId = jobId || '';
+        client.lastPing = Date.now();
+    } else {
+        // إذا لم يكن متصلاً، نخزن البيانات مؤقتاً لحين اتصاله
+        clients.set(username, {
+            ws: null,
+            userId,
+            placeId: placeId || '',
+            jobId: jobId || '',
+            lastPing: Date.now()
+        });
+    }
     res.status(200).json({ status: 'ok' });
 });
 
-// 2. إرسال أمر (من أي شخص، لكن العميل سيتحقق من القيادة)
+// 2. إرسال أمر (من قائد)
 app.post('/update', (req, res) => {
     const { username, userId, message, time, token } = req.body;
-    if (token !== SECRET_TOKEN) {
-        return res.status(401).json({ error: 'Invalid token' });
-    }
-    if (!message || !time) {
-        return res.status(400).json({ error: 'Missing message or time' });
-    }
+    if (token !== SECRET_TOKEN) return res.status(401).json({ error: 'Invalid token' });
+    if (!message || !time) return res.status(400).json({ error: 'Missing message or time' });
 
-    // تحليل الرسالة لتحديد الهدف
+    // تحليل الأمر
     const parts = message.split(' ');
     const cmd = parts[0];
     let target = 'all';
@@ -107,6 +74,165 @@ app.post('/update', (req, res) => {
     } else {
         if (parts.length >= 2) {
             target = parts[1];
+        } else {
+            target = 'all';
+        }
+    }
+
+    // إنشاء كائن الأمر
+    const commandData = {
+        time: time,
+        username: username,
+        userId: userId,
+        message: message,
+        token: SECRET_TOKEN
+    };
+
+    // دالة لإرسال الأمر إلى عميل معين
+    const sendToClient = (targetUsername) => {
+        const client = clients.get(targetUsername);
+        if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(JSON.stringify(commandData));
+            return true;
+        } else {
+            // تخزين الأمر معلقاً
+            pendingCommands.set(targetUsername, commandData);
+            return false;
+        }
+    };
+
+    if (target === 'all') {
+        // إرسال لجميع العملاء المتصلين
+        let sent = 0;
+        for (const [name, client] of clients) {
+            if (client.ws && client.ws.readyState === WebSocket.OPEN) {
+                client.ws.send(JSON.stringify(commandData));
+                sent++;
+            }
+        }
+        // إذا لم يتم الإرسال لأحد، نخزنه للأمر 'all'
+        if (sent === 0) {
+            pendingCommands.set('all', commandData);
+        }
+        // إذا كان هناك عملاء غير متصلين، نخزن لهم أيضاً (لكن الأفضل تخزين لـ all فقط)
+    } else {
+        // إرسال لهدف محدد
+        sendToClient(target);
+    }
+
+    res.status(200).json({ status: 'ok' });
+});
+
+// 3. قائمة اللاعبين (للواجهة)
+app.get('/players', (req, res) => {
+    const { token } = req.query;
+    if (token !== SECRET_TOKEN) return res.status(401).json({ error: 'Invalid token' });
+    const playerNames = Array.from(clients.keys());
+    res.status(200).json(playerNames);
+});
+
+// 4. الحصول على معلومات لاعب (لـ jointotarget)
+app.get('/player/:username', (req, res) => {
+    const { token } = req.query;
+    if (token !== SECRET_TOKEN) return res.status(401).json({ error: 'Invalid token' });
+    const username = req.params.username;
+    const client = clients.get(username);
+    if (!client) return res.status(404).json({ error: 'Player not found' });
+    res.status(200).json({
+        placeId: client.placeId || '',
+        jobId: client.jobId || ''
+    });
+});
+
+// ---------- WebSocket ----------
+wss.on('connection', (ws, req) => {
+    let registeredUsername = null;
+
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            if (data.type === 'register') {
+                if (data.token !== SECRET_TOKEN) {
+                    ws.close(1008, 'Invalid token');
+                    return;
+                }
+                const username = data.username;
+                if (!username) {
+                    ws.close(1008, 'Missing username');
+                    return;
+                }
+                // تسجيل العميل
+                registeredUsername = username;
+                // إذا كان هناك بيانات قديمة (من ping) ندمجها
+                const existing = clients.get(username) || {};
+                clients.set(username, {
+                    ws: ws,
+                    userId: existing.userId || 0,
+                    placeId: existing.placeId || '',
+                    jobId: existing.jobId || '',
+                    lastPing: Date.now()
+                });
+
+                // إرسال الأوامر المعلقة لهذا المستخدم أو 'all'
+                if (pendingCommands.has(username)) {
+                    ws.send(JSON.stringify(pendingCommands.get(username)));
+                    pendingCommands.delete(username);
+                }
+                if (pendingCommands.has('all')) {
+                    ws.send(JSON.stringify(pendingCommands.get('all')));
+                    pendingCommands.delete('all');
+                }
+                // تأكيد التسجيل
+                ws.send(JSON.stringify({ type: 'registered', status: 'ok' }));
+            }
+        } catch (e) {
+            // تجاهل الأخطاء
+        }
+    });
+
+    ws.on('close', () => {
+        if (registeredUsername) {
+            // لا نحذف العميل فوراً، بل نضع ws = null ليظل في القائمة
+            const client = clients.get(registeredUsername);
+            if (client) {
+                client.ws = null;
+                client.lastPing = Date.now(); // تحديث الوقت لمنع حذفه
+            }
+        }
+    });
+
+    ws.on('error', (err) => {
+        // تجاهل الأخطاء
+    });
+});
+
+// تنظيف العملاء غير النشطين (لم يرسلوا ping منذ 60 ثانية)
+setInterval(() => {
+    const now = Date.now();
+    for (const [name, client] of clients) {
+        if (now - client.lastPing > 60000) {
+            // إذا كان متصلاً، نغلق الاتصال
+            if (client.ws && client.ws.readyState === WebSocket.OPEN) {
+                client.ws.close();
+            }
+            clients.delete(name);
+        }
+    }
+}, 30000);
+
+// تنظيف الأوامر المعلقة القديمة (أكثر من 30 ثانية)
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, cmd] of pendingCommands) {
+        if (now - cmd.time > 30000) {
+            pendingCommands.delete(key);
+        }
+    }
+}, 15000);
+
+server.listen(PORT, () => {
+    console.log(`DEDSEC Server v2 with WebSocket running on port ${PORT}`);
+});            target = parts[1];
         } else {
             target = 'all';
         }
